@@ -1,21 +1,26 @@
 namespace PipeTriage.Models;
 
-public class Timeline
+/// <summary>
+/// Immutable record representing a pipeline run timeline.
+/// </summary>
+public sealed record Timeline(IReadOnlyList<TimelineRecord> Records);
+
+/// <summary>
+/// Immutable record representing a timeline record (job/step).
+/// </summary>
+public sealed record TimelineRecord(
+    string Id,
+    string Name,
+    string Type,
+    string Result,
+    TimelineLog? Log
+)
 {
-    public List<TimelineRecord> Records { get; set; } = new();
+    /// <summary>
+    /// Checks if this record represents a failed step.
+    /// </summary>
+    public bool IsFailed() =>
+        Result?.Equals("failed", StringComparison.OrdinalIgnoreCase) ?? false;
 }
 
-public class TimelineRecord
-{
-    public string Id { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public string Type { get; set; } = string.Empty;
-    public string Result { get; set; } = string.Empty;
-    public TimelineLog? Log { get; set; }
-}
-
-public class TimelineLog
-{
-    public int Id { get; set; }
-    public string Url { get; set; } = string.Empty;
-}
+public sealed record TimelineLog(int Id, string Url);

@@ -1,5 +1,7 @@
 using System.CommandLine;
 using PipeTriage;
+using PipeTriage.Core;
+using PipeTriage.Models;
 
 // Define CLI options
 var orgOption = new Option<string>(
@@ -23,48 +25,25 @@ var runIdOption = new Option<int>(
     IsRequired = true
 };
 
+var outputDirOption = new Option<string>(
+    name: "--output",
+    description: "Output directory for triage files",
+    getDefaultValue: () => ".pipetriage");
+
 // Create the summarize command
 var summarizeCommand = new Command("summarize", "Analyze and summarize a failed pipeline run")
 {
     orgOption,
     projectOption,
-    runIdOption
+    runIdOption,
+    outputDirOption
 };
 
-summarizeCommand.SetHandler(async (org, project, runId) =>
+summarizeCommand.SetHandler(async (org, project, runId, outputDir) =>
 {
-    try
-    {
-        // Get PAT from environment
-        var pat = Environment.GetEnvironmentVariable("AZDO_PAT");
-        if (string.IsNullOrWhiteSpace(pat))
-        {
-            Console.Error.WriteLine("Error: AZDO_PAT environment variable is not set.");
-            Console.Error.WriteLine("Please set your Azure DevOps Personal Access Token:");
-            Console.Error.WriteLine("  export AZDO_PAT=your-token-here");
-            Environment.Exit(1);
-            return;
-        }
-
-        // Create client and service
-        var client = new AzureDevOpsClient(pat);
-        var service = new TriageService(client);
-
-        // Execute the summarization
-        await service.SummarizeRunAsync(org, project, runId);
-    }
-    catch (HttpRequestException ex)
-    {
-        Console.Error.WriteLine($"Error communicating with Azure DevOps: {ex.Message}");
-        Console.Error.WriteLine("Please check your credentials, organization, project, and run ID.");
-        Environment.Exit(1);
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"Error: {ex.Message}");
-        Environment.Exit(1);
-    }
-}, orgOption, projectOption, runIdOption);
+    var exitCode = await ExecuteTriageAsync(org, project, runId, outputDir);
+    Environment.Exit(exitCode);
+}, orgOption, projectOption, runIdOption, outputDirOption);
 
 // Create root command
 var rootCommand = new RootCommand("pipetriage - Azure DevOps pipeline failure triage tool")
@@ -74,3 +53,80 @@ var rootCommand = new RootCommand("pipetriage - Azure DevOps pipeline failure tr
 
 // Execute
 return await rootCommand.InvokeAsync(args);
+
+// Pure functions and functional composition
+
+/// <summary>
+/// Main execution function using functional error handling.
+/// </summary>
+static async Task<int> ExecuteTriageAsync(string org, string project, int runId, string outputDir)
+{
+    var result = await GetPatFromEnvironment()
+        .Bind(pat => CreateTriageService(pat))
+        .BindAsync(async service => await RunTriageAnalysisAsync(service, org, project, runId, outputDir));
+
+    return result.Match(
+        onSuccess: _ => 0,
+        onFailure: error =>
+        {
+            Console.Error.WriteLine(error);
+            return 1;
+        });
+}
+
+/// <summary>
+/// Pure function to retrieve PAT from environment.
+/// </summary>
+static Result<string> GetPatFromEnvironment()
+{
+    var pat = Environment.GetEnvironmentVariable("AZDO_PAT");
+
+    return string.IsNullOrWhiteSpace(pat)
+        ? Result<string>.Fail(
+            "Error: AZDO_PAT environment variable is not set.\n" +
+            "Please set your Azure DevOps Personal Access Token:\n" +
+            "  export AZDO_PAT=your-token-here")
+        : Result<string>.Ok(pat);
+}
+
+/// <summary>
+/// Pure function to create triage service with dependencies.
+/// </summary>
+static Result<TriageService> CreateTriageService(string pat)
+{
+    try
+    {
+        var httpClient = new HttpClient();
+        var client = new AzureDevOpsClient(httpClient, pat);
+        var service = new TriageService(client);
+        return Result<TriageService>.Ok(service);
+    }
+    catch (Exception ex)
+    {
+        return Result<TriageService>.Fail($"Failed to create triage service: {ex.Message}");
+    }
+}
+
+/// <summary>
+/// Executes the triage analysis pipeline.
+/// </summary>
+static async Task<Result<TriageOutput>> RunTriageAnalysisAsync(
+    TriageService service,
+    string org,
+    string project,
+    int runId,
+    string outputDir)
+{
+    var request = new TriageRequest(org, project, runId, outputDir);
+
+    try
+    {
+        return await service.AnalyzeRunAsync(request);
+    }
+    catch (Exception ex)
+    {
+        return Result<TriageOutput>.Fail(
+            $"Error during triage analysis: {ex.Message}\n" +
+            "Please check your credentials, organization, project, and run ID.");
+    }
+}

@@ -1,96 +1,197 @@
 using System.Text.Json;
+using PipeTriage.Core;
 using PipeTriage.Models;
 
 namespace PipeTriage;
 
-public class TriageService
+/// <summary>
+/// Functional triage service that orchestrates pipeline analysis.
+/// Separates pure domain logic from IO operations.
+/// </summary>
+public sealed class TriageService
 {
-    private readonly AzureDevOpsClient _client;
+    private readonly IAzureDevOpsClient _client;
 
-    public TriageService(AzureDevOpsClient client)
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true
+    };
+
+    public TriageService(IAzureDevOpsClient client)
     {
         _client = client;
     }
 
-    public async Task SummarizeRunAsync(string org, string project, int runId, string outputRootDir = ".pipetriage")
+    /// <summary>
+    /// Main entry point for pipeline triage using functional composition.
+    /// </summary>
+    public async Task<Result<TriageOutput>> AnalyzeRunAsync(TriageRequest request)
     {
-        Console.WriteLine($"Fetching run details for run {runId}...");
+        Console.WriteLine($"Fetching run details for run {request.RunId}...");
 
-        // 1. Get run metadata
-        var run = await _client.GetRunAsync(org, project, runId);
+        // Compose the pipeline using Result monad
+        var result = await FetchTriageDataAsync(request)
+            .BindAsync(async data => await ProcessTriageDataAsync(data, request));
 
-        // Extract repository and branch information
-        var repository = run.Resources?.Repositories?.Self?.Repository?.Name ?? "Unknown";
-        var branch = run.Resources?.Repositories?.Self?.RefName ?? "Unknown";
+        return result;
+    }
 
-        // Create metadata object
-        var metadata = new Metadata
-        {
-            RunId = run.Id,
-            RunName = run.Name,
-            PipelineName = run.Pipeline?.Name ?? "Unknown",
-            State = run.State,
-            Result = run.Result,
-            Created = run.CreatedDate,
-            Finished = run.FinishedDate,
-            Repository = repository,
-            Branch = branch
-        };
+    /// <summary>
+    /// Fetches all required data from Azure DevOps APIs (IO operation).
+    /// </summary>
+    private async Task<Result<(RunDetails run, string yaml, Timeline timeline)>> FetchTriageDataAsync(
+        TriageRequest request)
+    {
+        var runResult = await _client.GetRunAsync(
+            request.Organization,
+            request.Project,
+            request.RunId);
 
-        // 2. Create output directory
-        var outputDir = Path.Combine(outputRootDir, runId.ToString());
-        Directory.CreateDirectory(outputDir);
-        Directory.CreateDirectory(Path.Combine(outputDir, "logs"));
+        if (runResult.IsFailure)
+            return Result<(RunDetails, string, Timeline)>.Fail(runResult.Match(_ => "", err => err));
 
-        // 3. Write metadata.json
-        var metadataPath = Path.Combine(outputDir, "metadata.json");
-        var metadataJson = JsonSerializer.Serialize(metadata, new JsonSerializerOptions
-        {
-            WriteIndented = true
-        });
-        await File.WriteAllTextAsync(metadataPath, metadataJson);
-        Console.WriteLine($"✓ Wrote metadata to {metadataPath}");
+        var yamlResult = await _client.GetPipelineYamlAsync(
+            request.Organization,
+            request.Project,
+            request.RunId);
 
-        // 4. Get and write pipeline YAML
+        if (yamlResult.IsFailure)
+            return Result<(RunDetails, string, Timeline)>.Fail(yamlResult.Match(_ => "", err => err));
+
+        var timelineResult = await _client.GetTimelineAsync(
+            request.Organization,
+            request.Project,
+            request.RunId);
+
+        if (timelineResult.IsFailure)
+            return Result<(RunDetails, string, Timeline)>.Fail(timelineResult.Match(_ => "", err => err));
+
+        return runResult.Bind(run =>
+            yamlResult.Bind(yaml =>
+                timelineResult.Map(timeline => (run, yaml, timeline))));
+    }
+
+    /// <summary>
+    /// Processes fetched data into triage output (pure + IO).
+    /// </summary>
+    private async Task<Result<TriageOutput>> ProcessTriageDataAsync(
+        (RunDetails run, string yaml, Timeline timeline) data,
+        TriageRequest request)
+    {
+        // Pure: Extract metadata
+        var metadata = Metadata.FromRunDetails(data.run);
+
+        // Pure: Find failed step
+        var failedRecord = FindFirstFailedStep(data.timeline);
+
+        // IO: Fetch log if failed step exists
+        var failedStepInfo = failedRecord is not null
+            ? await FetchFailedStepInfoAsync(failedRecord)
+            : null;
+
+        // Pure: Create output
+        var output = new TriageOutput(metadata, data.yaml, failedStepInfo);
+
+        // IO: Write files
+        await WriteTriageOutputAsync(output, request);
+
+        // IO: Print summary
+        PrintSummary(output, request.OutputDirectory);
+
+        return Result<TriageOutput>.Ok(output);
+    }
+
+    /// <summary>
+    /// Pure function to find the first failed step in a timeline.
+    /// </summary>
+    private static TimelineRecord? FindFirstFailedStep(Timeline timeline) =>
+        timeline.Records.FirstOrDefault(r => r.IsFailed() && r.Log is not null);
+
+    /// <summary>
+    /// Fetches failed step information including logs (IO operation).
+    /// </summary>
+    private async Task<FailedStepInfo?> FetchFailedStepInfoAsync(TimelineRecord record)
+    {
+        if (record.Log is null)
+            return null;
+
+        Console.WriteLine($"Found failed step: {record.Name}");
+        Console.WriteLine("Downloading log...");
+
+        var logResult = await _client.GetLogContentAsync(record.Log.Url);
+
+        return logResult.Match(
+            onSuccess: content => new FailedStepInfo(record.Name, content),
+            onFailure: _ => null);
+    }
+
+    /// <summary>
+    /// Writes triage output to disk (IO operation).
+    /// </summary>
+    private async Task WriteTriageOutputAsync(TriageOutput output, TriageRequest request)
+    {
+        var outputDir = BuildOutputDirectory(request);
+        CreateOutputDirectories(outputDir);
+
+        // Write metadata
         Console.WriteLine("Fetching pipeline YAML...");
-        var yaml = await _client.GetPipelineYamlAsync(org, project, runId);
-        var yamlPath = Path.Combine(outputDir, "pipeline.yaml");
-        await File.WriteAllTextAsync(yamlPath, yaml);
-        Console.WriteLine($"✓ Wrote pipeline YAML to {yamlPath}");
+        await WriteJsonFileAsync(
+            Path.Combine(outputDir, "metadata.json"),
+            output.Metadata);
+        Console.WriteLine($"✓ Wrote metadata to {Path.Combine(outputDir, "metadata.json")}");
 
-        // 5. Get timeline and find failed step
-        Console.WriteLine("Analyzing timeline for failed steps...");
-        var timeline = await _client.GetTimelineAsync(org, project, runId);
+        // Write YAML
+        await WriteTextFileAsync(
+            Path.Combine(outputDir, "pipeline.yaml"),
+            output.PipelineYaml);
+        Console.WriteLine($"✓ Wrote pipeline YAML to {Path.Combine(outputDir, "pipeline.yaml")}");
 
-        var failedRecord = timeline.Records.FirstOrDefault(r =>
-            r.Result?.Equals("failed", StringComparison.OrdinalIgnoreCase) == true);
-
-        if (failedRecord != null && failedRecord.Log != null)
+        // Write failed step log if exists
+        if (output.FailedStep is not null)
         {
-            Console.WriteLine($"Found failed step: {failedRecord.Name}");
-            Console.WriteLine("Downloading log...");
+            await WriteTextFileAsync(
+                Path.Combine(outputDir, "logs", "failed-step.log"),
+                output.FailedStep.LogContent);
+            Console.WriteLine($"✓ Wrote failed step log to {Path.Combine(outputDir, "logs", "failed-step.log")}");
+        }
+    }
 
-            var logContent = await _client.GetLogContentAsync(failedRecord.Log.Url);
-            var logPath = Path.Combine(outputDir, "logs", "failed-step.log");
-            await File.WriteAllTextAsync(logPath, logContent);
-            Console.WriteLine($"✓ Wrote failed step log to {logPath}");
+    /// <summary>
+    /// Prints summary to console (IO operation).
+    /// </summary>
+    private static void PrintSummary(TriageOutput output, string outputDir)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== Summary ===");
+        Console.WriteLine($"Pipeline: {output.Metadata.PipelineName} (run {output.Metadata.RunId}) – Result: {output.Metadata.Result}");
+        Console.WriteLine($"Repo: {output.Metadata.Repository}, Branch: {output.Metadata.Branch}");
 
-            // Print summary
-            Console.WriteLine();
-            Console.WriteLine("=== Summary ===");
-            Console.WriteLine($"Pipeline: {metadata.PipelineName} (run {metadata.RunId}) – Result: {metadata.Result}");
-            Console.WriteLine($"Repo: {metadata.Repository}, Branch: {metadata.Branch}");
-            Console.WriteLine($"Failed step: {failedRecord.Name} – log: logs/failed-step.log");
-            Console.WriteLine($"All files written to: {outputDir}");
+        if (output.FailedStep is not null)
+        {
+            Console.WriteLine($"Failed step: {output.FailedStep.StepName} – log: logs/failed-step.log");
         }
         else
         {
             Console.WriteLine("⚠ No failed steps found in timeline");
-            Console.WriteLine();
-            Console.WriteLine("=== Summary ===");
-            Console.WriteLine($"Pipeline: {metadata.PipelineName} (run {metadata.RunId}) – Result: {metadata.Result}");
-            Console.WriteLine($"Repo: {metadata.Repository}, Branch: {metadata.Branch}");
-            Console.WriteLine($"All files written to: {outputDir}");
         }
+
+        Console.WriteLine($"All files written to: {BuildOutputDirectory(new TriageRequest("", "", output.Metadata.RunId, outputDir))}");
     }
+
+    // Pure helper functions
+    private static string BuildOutputDirectory(TriageRequest request) =>
+        Path.Combine(request.OutputDirectory, request.RunId.ToString());
+
+    // IO helper functions
+    private static void CreateOutputDirectories(string outputDir)
+    {
+        Directory.CreateDirectory(outputDir);
+        Directory.CreateDirectory(Path.Combine(outputDir, "logs"));
+    }
+
+    private static async Task WriteJsonFileAsync<T>(string path, T data) =>
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(data, JsonOptions));
+
+    private static async Task WriteTextFileAsync(string path, string content) =>
+        await File.WriteAllTextAsync(path, content);
 }

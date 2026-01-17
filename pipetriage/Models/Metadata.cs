@@ -1,14 +1,33 @@
 namespace PipeTriage.Models;
 
-public class Metadata
+/// <summary>
+/// Immutable record representing pipeline run metadata for output.
+/// </summary>
+public sealed record Metadata(
+    int RunId,
+    string RunName,
+    string PipelineName,
+    string State,
+    string Result,
+    DateTime? Created,
+    DateTime? Finished,
+    string Repository,
+    string Branch
+)
 {
-    public int RunId { get; set; }
-    public string RunName { get; set; } = string.Empty;
-    public string PipelineName { get; set; } = string.Empty;
-    public string State { get; set; } = string.Empty;
-    public string Result { get; set; } = string.Empty;
-    public DateTime? Created { get; set; }
-    public DateTime? Finished { get; set; }
-    public string Repository { get; set; } = string.Empty;
-    public string Branch { get; set; } = string.Empty;
+    /// <summary>
+    /// Creates metadata from RunDetails using pure functional transformation.
+    /// </summary>
+    public static Metadata FromRunDetails(RunDetails run) =>
+        new(
+            RunId: run.Id,
+            RunName: run.Name,
+            PipelineName: run.Pipeline?.Name ?? "Unknown",
+            State: run.State,
+            Result: run.Result,
+            Created: run.CreatedDate,
+            Finished: run.FinishedDate,
+            Repository: run.Resources?.Repositories?.Self?.Repository?.Name ?? "Unknown",
+            Branch: run.Resources?.Repositories?.Self?.RefName ?? "Unknown"
+        );
 }
