@@ -1,0 +1,40 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+*.userprefs
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio
+.vs/
+*.vsidx
+*.vsconfig
+
+# Rider
+.idea/
+*.sln.iml
+
+# Output directories
+.pipetriage/
+
+# Environment files
+.env
+*.env
+
+# macOS
+.DS_Store
